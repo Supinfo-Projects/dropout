@@ -1,0 +1,17 @@
+# Dépendances directes du projet, versions figées pour la reproductibilité.
+# Installation : pip install -r requirements.txt  (ou : make install avec uv)
+fastapi==0.150.0
+httpx==0.28.1          # tests de l'API (client de test)
+locust==2.47.0         # tests de charge
+matplotlib==3.11.2     # matrice de confusion (artefact MLflow)
+mlflow==3.18.0         # traçabilité + registre de modèles
+numpy==2.5.5
+pandas==3.1.1
+prefect==3.9.3         # orchestration des pipelines
+prometheus-client==0.26.0
+pydantic==2.14.3
+pydantic-settings==2.16.3
+pytest==9.2.0
+ruff==0.17.5           # qualité de code (lint)
+scikit-learn==1.9.1
+uvicorn==0.54.0

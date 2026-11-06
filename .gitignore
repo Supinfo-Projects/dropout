@@ -1,0 +1,30 @@
+# Environnements
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Secrets et configuration locale
+.env
+
+# Données volumineuses (récupérées par le pipeline, jamais versionnées)
+data/raw/
+data/batches/
+
+# Artefacts générés (modèles, rapports, bases locales)
+artifacts/
+
+# Sorties de tests de charge
+load_tests/results/
+
+# Préfect
+.prefect/
+
+# Divers
+*.log
+.DS_Store
