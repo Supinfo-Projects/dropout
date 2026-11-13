@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 30s
+
+scrape_configs:
+  # Métriques de l'API de prédiction : débit, latences, erreurs,
+  # prédictions par classe, feedbacks, rechargements de modèle.
+  # (MLflow n'expose pas d'endpoint Prometheus : sa disponibilité est
+  # supervisée par l'alerting du pipeline, qui échoue et alerte s'il est injoignable.)
+  - job_name: api-decrochage
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:8000"]

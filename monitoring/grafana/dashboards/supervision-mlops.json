@@ -1,0 +1,103 @@
+{
+  "title": "Supervision MLOps — Décrochage académique",
+  "uid": "mlops-decrochage",
+  "tags": ["mlops", "5mlde"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Requêtes par seconde (par endpoint)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": null },
+      "targets": [
+        {
+          "expr": "sum by (endpoint) (rate(api_requests_total[1m]))",
+          "legendFormat": "{{endpoint}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Latences de l'API (p50 / p95 / p99)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": null },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(api_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(api_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(api_request_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Taux d'erreur (réponses 4xx / 5xx)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": null },
+      "targets": [
+        {
+          "expr": "sum by (statut) (rate(api_requests_total{statut=~\"4..|5..\"}[1m]))",
+          "legendFormat": "HTTP {{statut}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Prédictions servies par classe",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": null },
+      "targets": [
+        {
+          "expr": "sum by (classe) (rate(api_predictions_total[5m]))",
+          "legendFormat": "{{classe}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Feedbacks reçus",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": null },
+      "targets": [{ "expr": "api_feedbacks_total", "legendFormat": "feedbacks" }]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Rechargements de modèle",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": null },
+      "targets": [{ "expr": "api_model_reloads_total", "legendFormat": "rechargements" }]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Prédictions totales servies",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": null },
+      "targets": [{ "expr": "sum(api_predictions_total)", "legendFormat": "prédictions" }]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Disponibilité API",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": null },
+      "targets": [{ "expr": "up{job=\"api-decrochage\"}", "legendFormat": "API" }]
+    }
+  ]
+}
