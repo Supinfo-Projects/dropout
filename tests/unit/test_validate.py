@@ -1,5 +1,3 @@
-"""Tests unitaires des contrôles qualité : chaque règle doit bloquer quand elle doit."""
-
 import json
 
 import pytest
@@ -66,7 +64,7 @@ def test_validate_or_raise_interrompt_et_sauvegarde_le_rapport(sample_frame):
     frame["Admission grade"] = 999.0
     with pytest.raises(DataValidationError) as excinfo:
         validate_or_raise(frame)
-    assert "Contrôles qualité en échec" in str(excinfo.value)
+    assert "Controles qualité en échec" in str(excinfo.value)
 
     from dropout_pred.config import get_settings
 
@@ -82,3 +80,63 @@ def test_validate_or_raise_passe_sans_exception(sample_frame):
     report, path = validate_or_raise(sample_frame)
     assert report.passed
     assert path.exists()
+
+
+def test_texte_dans_colonne_numerique_bloque(sample_frame):
+    frame = sample_frame.copy()
+    frame["Admission grade"] = "invalide"
+    report = validate_frame(frame)
+    assert not report.passed
+    failures = {result.name: result for result in report.failures()}
+    assert "types_numeriques" in failures
+    assert failures["types_numeriques"].details["Admission grade"]["non_numeriques"] > 0
+
+
+def test_valeur_non_finie_bloque(sample_frame):
+    frame = sample_frame.copy()
+    frame["Admission grade"] = float("inf")
+    report = validate_frame(frame)
+    assert not report.passed
+    failures = {result.name: result for result in report.failures()}
+    assert "types_numeriques" in failures
+    assert failures["types_numeriques"].details["Admission grade"]["non_finies"] > 0
+
+
+def test_valeur_fractionnaire_dans_colonne_entiere_bloque(sample_frame):
+    frame = sample_frame.copy()
+    frame["Gender"] = 0.5
+    report = validate_frame(frame)
+    assert not report.passed
+    failures = {result.name: result for result in report.failures()}
+    assert "valeurs_discretes" in failures
+    assert failures["valeurs_discretes"].details["Gender"]["valeurs_non_entieres"] > 0
+
+
+def test_binaire_hors_domaine_bloque(sample_frame):
+    frame = sample_frame.copy()
+    frame["Gender"] = 9
+    report = validate_frame(frame)
+    assert not report.passed
+    failures = {result.name: result for result in report.failures()}
+    assert "domaines_categoriques" in failures
+    assert failures["domaines_categoriques"].details["Gender"]["valeurs_hors_domaine"] > 0
+
+
+def test_categoriel_hors_domaine_bloque(sample_frame):
+    frame = sample_frame.copy()
+    frame["Marital status"] = 99
+    report = validate_frame(frame)
+    assert not report.passed
+    failures = {result.name: result for result in report.failures()}
+    assert "domaines_categoriques" in failures
+    assert failures["domaines_categoriques"].details["Marital status"]["valeurs_hors_domaine"] > 0
+
+
+def test_domaines_ne_bloquent_pas_les_donnees_saines(frame_factory):
+    # Les données saines aux bornes doivent passer
+    frame = frame_factory(500)
+    from dropout_pred.data.schema import BINARY_COLUMNS
+
+    frame.loc[:, list(BINARY_COLUMNS)] = 0
+    report = validate_frame(frame)
+    assert report.passed, report.summary()

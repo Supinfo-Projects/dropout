@@ -1,10 +1,8 @@
-"""Schéma attendu du dataset et constantes partagées (colonnes, cible, plages de valeurs)."""
+"""Schéma attendu du dataset et constantes partagées."""
 
-# Cible : 3 classes
 TARGET_COLUMN = "Target"
 TARGET_CLASSES = ["Dropout", "Enrolled", "Graduate"]
 
-# Colonnes numériques continues : plages de valeurs attendues (bornes inclusives)
 CONTINUOUS_RANGES = {
     "Previous qualification (grade)": (0.0, 200.0),
     "Admission grade": (0.0, 200.0),
@@ -16,7 +14,6 @@ CONTINUOUS_RANGES = {
     "Age at enrollment": (15.0, 100.0),
 }
 
-# Colonnes numériques discrètes : valeurs entières >= 0
 DISCRETE_NON_NEGATIVE = [
     "Marital status",
     "Application mode",
@@ -48,11 +45,34 @@ DISCRETE_NON_NEGATIVE = [
     "Curricular units 2nd sem (without evaluations)",
 ]
 
+BINARY_COLUMNS = [
+    "Daytime/evening attendance",
+    "Displaced",
+    "Educational special needs",
+    "Debtor",
+    "Tuition fees up to date",
+    "Gender",
+    "Scholarship holder",
+    "International",
+]
+
+CATEGORICAL_RANGES = {
+    "Marital status": (1, 6),
+    "Application mode": (1, 57),
+    "Application order": (0, 9),
+    "Course": (1, 9991),
+    "Previous qualification": (1, 44),
+    "Nacionality": (1, 109),
+    "Mother's qualification": (1, 44),
+    "Father's qualification": (1, 44),
+    "Mother's occupation": (0, 195),
+    "Father's occupation": (0, 195),
+}
+
 FEATURE_COLUMNS = DISCRETE_NON_NEGATIVE + list(CONTINUOUS_RANGES.keys())
 assert len(FEATURE_COLUMNS) == 36
 
-# Règles de qualité : seuils configurés pour un lot de données
 MIN_ROWS_PER_BATCH = 300
-MIN_CLASS_SHARE = 0.05  # chaque classe doit représenter au moins 5 % des lignes
+MIN_CLASS_SHARE = 0.05  # chaque classe doit représenter au moins 5% des lignes
 MAX_MISSING_SHARE = 0.01  # tolérance de valeurs manquantes avant blocage
 MAX_DUPLICATE_SHARE = 0.02  # tolérance de doublons avant blocage

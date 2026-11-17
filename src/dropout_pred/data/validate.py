@@ -1,11 +1,3 @@
-"""Contrôles qualité bloquants sur les données, avant tout prétraitement ou entraînement.
-
-Chaque règle produit un résultat (réussite / échec + détails). Le rapport complet est
-sauvegardé en JSON dans artifacts/validation/ pour être tracé comme artefact MLflow.
-Si une seule règle échoue, une DataValidationError est levée : l'entraînement est
-interrompu et l'orchestrateur déclenche l'alerte.
-"""
-
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,6 +7,8 @@ import pandas as pd
 
 from ..config import Settings, get_settings
 from .schema import (
+    BINARY_COLUMNS,
+    CATEGORICAL_RANGES,
     CONTINUOUS_RANGES,
     DISCRETE_NON_NEGATIVE,
     FEATURE_COLUMNS,
@@ -28,7 +22,7 @@ from .schema import (
 
 
 class DataValidationError(Exception):
-    """Erreur levée quand les données ne sont pas conformes : l'entraînement doit être interrompu."""
+    """Erreur levée quand les données ne sont pas conformes, donc l'entrainement doit être interrompu."""
 
 
 @dataclass
@@ -51,8 +45,8 @@ class ValidationReport:
 
     def summary(self) -> str:
         lines = [
-            f"Validation des données : {'CONFORME' if self.passed else 'NON CONFORME'}",
-            f"  Lignes analysées : {self.n_rows}",
+            f"Validation des données: {'CONFORME' if self.passed else 'NON CONFORME'}",
+            f"  Lignes analysées: {self.n_rows}",
         ]
         for result in self.results:
             status = "OK " if result.passed else "ECHEC"
@@ -89,6 +83,20 @@ def _check_duplicates(frame: pd.DataFrame) -> RuleResult:
     )
 
 
+def _check_types(frame: pd.DataFrame) -> RuleResult:
+    violations = {}
+    for column in FEATURE_COLUMNS:
+        if column not in frame.columns:
+            continue
+        original = frame[column]
+        converted = pd.to_numeric(original, errors="coerce")
+        non_numeriques = int(((converted.isna()) & (~original.isna())).sum())
+        non_finies = int((converted.abs() == float("inf")).sum())
+        if non_numeriques or non_finies:
+            violations[column] = {"non_numeriques": non_numeriques, "non_finies": non_finies}
+    return RuleResult("types_numeriques", not violations, violations)
+
+
 def _check_ranges(frame: pd.DataFrame) -> RuleResult:
     violations = {}
     for column, (low, high) in CONTINUOUS_RANGES.items():
@@ -108,9 +116,29 @@ def _check_discrete(frame: pd.DataFrame) -> RuleResult:
             continue
         values = pd.to_numeric(frame[column], errors="coerce")
         invalid = int((values < 0).sum())
-        if invalid:
-            violations[column] = {"valeurs_negatives": invalid}
+        non_entiers = int(((values.dropna() % 1) != 0).sum())
+        if invalid or non_entiers:
+            violations[column] = {"valeurs_negatives": invalid, "valeurs_non_entieres": non_entiers}
     return RuleResult("valeurs_discretes", not violations, violations)
+
+
+def _check_domains(frame: pd.DataFrame) -> RuleResult:
+    violations = {}
+    for column in BINARY_COLUMNS:
+        if column not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce")
+        invalid = int((~values.isin([0, 1])).sum())
+        if invalid:
+            violations[column] = {"valeurs_hors_domaine": invalid, "domaine_attendu": [0, 1]}
+    for column, (low, high) in CATEGORICAL_RANGES.items():
+        if column not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce")
+        invalid = int(((values < low) | (values > high)).sum())
+        if invalid:
+            violations[column] = {"valeurs_hors_domaine": invalid, "domaine_attendu": [low, high]}
+    return RuleResult("domaines_categoriques", not violations, violations)
 
 
 def _check_target(frame: pd.DataFrame) -> RuleResult:
@@ -133,14 +161,15 @@ def _check_class_distribution(frame: pd.DataFrame) -> RuleResult:
 
 
 def validate_frame(frame: pd.DataFrame) -> ValidationReport:
-    """Exécute toutes les règles de qualité sur un DataFrame et produit le rapport."""
     checks = [
         _check_schema,
         _check_volume,
         _check_missing,
         _check_duplicates,
+        _check_types,
         _check_ranges,
         _check_discrete,
+        _check_domains,
         _check_target,
         _check_class_distribution,
     ]
@@ -156,12 +185,6 @@ def validate_frame(frame: pd.DataFrame) -> ValidationReport:
 
 
 def validate_or_raise(frame: pd.DataFrame, settings: Settings | None = None) -> tuple[ValidationReport, Path]:
-    """Valide les données et interrompt le pipeline en cas de non-conformité.
-
-    Le rapport est systématiquement sauvegardé en JSON (réussite ou échec) afin de
-    garder une trace des contrôles effectués à chaque exécution. Retourne le rapport
-    et le chemin du fichier JSON (tracé comme artefact MLflow).
-    """
     settings = settings or get_settings()
     report = validate_frame(frame)
 
@@ -192,7 +215,7 @@ def validate_or_raise(frame: pd.DataFrame, settings: Settings | None = None) -> 
             for result in report.failures()
         )
         raise DataValidationError(
-            f"Contrôles qualité en échec ({report.n_failed_rules} règle(s)) :\n{failures}\n"
-            f"Rapport complet : {report_path}"
+            f"Controles qualité en échec ({report.n_failed_rules} règle(s)) :\n{failures}\n"
+            f"Rapport complet: {report_path}"
         )
     return report, report_path
