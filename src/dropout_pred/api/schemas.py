@@ -1,16 +1,14 @@
-"""Schémas de validation des entrées / sorties de l'API (pydantic)."""
+"""Schémas de validation des entrées et sorties de l'API."""
 
 from pydantic import BaseModel, Field
 
 
 class StudentFeatures(BaseModel):
-    """Caractéristiques d'un étudiant : validation stricte des 36 variables attendues."""
-
     marital_status: int = Field(alias="Marital status", ge=0)
     application_mode: int = Field(alias="Application mode", ge=0)
     application_order: int = Field(alias="Application order", ge=0)
     course: int = Field(alias="Course", ge=0)
-    daytime_evening_attendance: int = Field(alias="Daytime/evening attendance", ge=0)
+    daytime_evening_attendance: int = Field(alias="Daytime/evening attendance", ge=0, le=1)
     previous_qualification: int = Field(alias="Previous qualification", ge=0)
     previous_qualification_grade: float = Field(
         alias="Previous qualification (grade)", ge=0, le=200
@@ -21,14 +19,14 @@ class StudentFeatures(BaseModel):
     mother_occupation: int = Field(alias="Mother's occupation", ge=0)
     father_occupation: int = Field(alias="Father's occupation", ge=0)
     admission_grade: float = Field(alias="Admission grade", ge=0, le=200)
-    displaced: int = Field(alias="Displaced", ge=0)
-    educational_special_needs: int = Field(alias="Educational special needs", ge=0)
-    debtor: int = Field(alias="Debtor", ge=0)
-    tuition_fees_up_to_date: int = Field(alias="Tuition fees up to date", ge=0)
-    gender: int = Field(alias="Gender", ge=0)
-    scholarship_holder: int = Field(alias="Scholarship holder", ge=0)
+    displaced: int = Field(alias="Displaced", ge=0, le=1)
+    educational_special_needs: int = Field(alias="Educational special needs", ge=0, le=1)
+    debtor: int = Field(alias="Debtor", ge=0, le=1)
+    tuition_fees_up_to_date: int = Field(alias="Tuition fees up to date", ge=0, le=1)
+    gender: int = Field(alias="Gender", ge=0, le=1)
+    scholarship_holder: int = Field(alias="Scholarship holder", ge=0, le=1)
     age_at_enrollment: int = Field(alias="Age at enrollment", ge=15, le=100)
-    international: int = Field(alias="International", ge=0)
+    international: int = Field(alias="International", ge=0, le=1)
     curricular_units_1st_credited: int = Field(alias="Curricular units 1st sem (credited)", ge=0)
     curricular_units_1st_enrolled: int = Field(alias="Curricular units 1st sem (enrolled)", ge=0)
     curricular_units_1st_evaluations: int = Field(alias="Curricular units 1st sem (evaluations)", ge=0)
@@ -53,8 +51,6 @@ class StudentFeatures(BaseModel):
 
 
 class BatchPredictionRequest(BaseModel):
-    """Prédiction en lot : 100 étudiants maximum par requête."""
-
     students: list[StudentFeatures] = Field(min_length=1, max_length=100)
 
 
@@ -72,8 +68,6 @@ class BatchPredictionResponse(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    """Retour d'utilisation : la classe réelle observée pour une prédiction donnée."""
-
     classe_reelle: str
 
 

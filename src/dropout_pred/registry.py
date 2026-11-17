@@ -1,9 +1,13 @@
-"""Gestion du registre de modèles MLflow : tags de cycle de vie, promotion, retour arrière.
+"""Gestion du registre de modèles MLflow.
 
-Le choix fait en cours est repris : l'API charge le modèle via un TAG (stage=production)
+Le choix fait en cours est repris. L'API charge le modèle via un TAG
 et non via une version en dur. Tagger une nouvelle version en production suffit à la
 servir, sans redéploiement ni modification applicative.
 """
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 import mlflow
 from mlflow import MlflowClient
@@ -14,6 +18,40 @@ STAGE_TAG = "stage"
 STAGE_PRODUCTION = "production"
 STAGE_RELEASE_CANDIDATE = "release_candidate"
 STAGE_ARCHIVED = "archive"
+
+
+def _history_path(settings: Settings) -> Path:
+    return settings.artifacts_dir / "registry" / "deployments.json"
+
+
+def _read_history(settings: Settings) -> list:
+    path = _history_path(settings)
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _append_history(settings: Settings, action: str, version: str, ancienne_production) -> None:
+    """Historique explicite des déploiements.
+
+    C'est la base du retour arrière. On remonte l'historique plutôt que de deviner
+    (par numéro de version) quelle version restaurer.
+    """
+    path = _history_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    history = _read_history(settings)
+    history.append(
+        {
+            "horodatage": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "action": action,
+            "version": str(version),
+            "ancienne_production": str(ancienne_production) if ancienne_production is not None else None,
+        }
+    )
+    path.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def get_client(settings: Settings | None = None) -> MlflowClient:
@@ -58,48 +96,68 @@ def tag_version(version_number: str, stage: str, settings: Settings | None = Non
 
 
 def promote_to_production(version_number: str, settings: Settings | None = None) -> None:
-    """Promeut une version en production : l'ancienne version en production est archivée."""
+    """Push une version en production, sans fenêtre sans production.
+
+    La nouvelle version est taggée production avant d'archiver l'ancienne. Un échec
+    intermédiaire ne peut pas laisser le registre sans version servie. L'opération
+    est tracée dans l'historique des déploiements (base du retour arrière).
+    """
     settings = settings or get_settings()
     current = get_production_version(settings)
-    if current is not None and str(current.version) != str(version_number):
-        tag_version(current.version, STAGE_ARCHIVED, settings)
+    if current is not None and str(current.version) == str(version_number):
+        return
     tag_version(version_number, STAGE_PRODUCTION, settings)
+    if current is not None:
+        tag_version(current.version, STAGE_ARCHIVED, settings)
+    _append_history(settings, "promotion", version_number, current.version if current else None)
 
 
 def rollback(settings: Settings | None = None) -> dict:
-    """Retour arrière : remet en production la version archivée la plus récente.
+    """Retour arrière basé sur l'historique explicite des déploiements.
 
-    Retourne un résumé de l'opération (ancienne et nouvelle version en production).
+    On restaure la production qui précédait le dernier déploiement enregistré, puis
+    on trace ce retour arrière dans l'historique. En l'absence d'historique (première
+    exécution sur un registre existant), on retombe sur la version archivée la plus
+    récente. Retourne un résumé de l'opération.
     """
-    # TODO(arthur): gael regarde si les alias MLflow (@prod) peuvent remplacé le fichier
     settings = settings or get_settings()
     versions = get_versions(settings)
     current = get_production_version(settings)
-    archived = [v for v in versions if v.tags.get(STAGE_TAG) == STAGE_ARCHIVED]
-    if not archived:
-        raise RuntimeError("Aucune version archivée disponible pour un retour arrière.")
-    target = archived[0]
+
+    history = _read_history(settings)
+    target = None
+    if history:
+        target = history[-1].get("ancienne_production")
+    if target is None:
+        archived = [v for v in versions if v.tags.get(STAGE_TAG) == STAGE_ARCHIVED]
+        if not archived:
+            raise RuntimeError("Aucune version archivée disponible pour un retour arrière.")
+        target = archived[0].version
+    if current is not None and str(current.version) == str(target):
+        raise RuntimeError(f"La production est déjà la version {target}: rien à restaurer.")
+
+    tag_version(target, STAGE_PRODUCTION, settings)
     if current is not None:
         tag_version(current.version, STAGE_ARCHIVED, settings)
-    tag_version(target.version, STAGE_PRODUCTION, settings)
+    _append_history(settings, "retour_arriere", target, current.version if current else None)
     return {
         "ancienne_production": current.version if current else None,
-        "nouvelle_production": target.version,
+        "nouvelle_production": str(target),
     }
 
 
 def load_production_model(settings: Settings | None = None):
     """Charge le modèle en production depuis le registre MLflow.
 
-    La flavor sklearn est utilisée (et non pyfunc) pour disposer de predict_proba :
-    les probabilités par classe sont persistées avec chaque prédiction.
+    La flavor sklearn est utilisée (et non pyfunc) pour disposer de predict_proba.
+    Les probabilités par classe sont persistées avec chaque prédiction.
     """
     settings = settings or get_settings()
     version = get_production_version(settings)
     if version is None:
         raise RuntimeError(
             f"Aucune version taggée '{STAGE_PRODUCTION}' pour le modèle "
-            f"'{settings.mlflow_model_name}'. Lancez d'abord le pipeline d'entraînement."
+            f"'{settings.mlflow_model_name}'. Lancez d'abord le pipeline d'entrainement."
         )
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     model = mlflow.sklearn.load_model(f"models:/{settings.mlflow_model_name}/{version.version}")

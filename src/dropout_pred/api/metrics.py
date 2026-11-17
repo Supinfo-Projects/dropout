@@ -1,8 +1,4 @@
-"""Métriques Prometheus exposées par l'API (niveau API + niveau métier).
-
-Sont suivis : le débit et les latences par endpoint, le taux d'erreur, la distribution
-des prédictions par classe, les rechargements de modèle et les feedbacks reçus.
-"""
+"""Métriques Prometheus exposées par l'API"""
 
 from prometheus_client import Counter, Histogram
 

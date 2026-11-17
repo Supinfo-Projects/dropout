@@ -1,5 +1,3 @@
-"""Tests de l'API : validation des entrées, prédictions, feedbacks, métriques, persistance."""
-
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -49,8 +47,6 @@ VALID_STUDENT = {
 
 
 class FakeModel:
-    """Modèle factice : prédictions déterministes pour tester l'API sans MLflow."""
-
     def predict_proba(self, frame):
         n = len(frame)
         probs = np.full((n, 3), 0.2)
@@ -59,17 +55,21 @@ class FakeModel:
 
 
 class FakeVersion:
-    version = "42"
+    # MLflow retourne un entier, l'API attend une chaine
+    version = 42
     run_id = "fake-run"
 
 
 class FakeService:
     def __init__(self):
         self.reload_called = False
+        self.fail_load = False
 
     def load(self, force=False):
         if force:
             self.reload_called = True
+        if self.fail_load:
+            raise RuntimeError("registre MLflow indisponible")
         return FakeModel(), FakeVersion()
 
     def info(self):
@@ -80,6 +80,11 @@ class FakeService:
             "run_id": "fake-run",
             "f1_macro": 0.55,
         }
+
+
+class FakeModelQuiEchoue:
+    def predict_proba(self, frame):
+        raise ValueError("boom")
 
 
 @pytest.fixture
@@ -184,3 +189,87 @@ def test_info_modele(client):
     body = test_client.get("/model/info").json()
     assert body["version"] == "42"
     assert body["stage"] == "production"
+
+
+def test_version_mlflow_entiere_normalisee_en_chaine(client):
+    # MLflow retourne un entier, l'API doit le convertir en chaine
+    test_client, _ = client
+    response = test_client.post("/predict", json=VALID_STUDENT)
+    assert response.status_code == 200
+    assert response.json()["model_version"] == "42"
+
+
+def test_erreur_422_persistee_en_sqlite(client):
+    # Même les erreurs 422 doivent être comptées dans les stats
+    test_client, _ = client
+    payload = {key: value for key, value in VALID_STUDENT.items() if key != "Admission grade"}
+    response = test_client.post("/predict", json=payload)
+    assert response.status_code == 422
+    stats = test_client.get("/stats").json()
+    assert stats["total_predictions"] >= 1
+    assert stats["taux_erreur"] > 0
+
+
+def test_panne_de_chargement_modele_comptee_et_persistee(client, monkeypatch):
+    # Une panne de chargement doit être tracée dans SQLite et Prometheus
+    from prometheus_client import REGISTRY
+
+    test_client, service = client
+    service.fail_load = True
+    avant = REGISTRY.get_sample_value("api_requests_total", {"endpoint": "/predict", "statut": "500"}) or 0.0
+
+    response = test_client.post("/predict", json=VALID_STUDENT)
+    assert response.status_code == 500
+
+    apres = REGISTRY.get_sample_value("api_requests_total", {"endpoint": "/predict", "statut": "500"}) or 0.0
+    assert apres > avant
+    stats = test_client.get("/stats").json()
+    assert stats["taux_erreur"] > 0
+
+
+def test_erreur_de_prediction_une_seule_trace(client, monkeypatch):
+    # Même en cas d'erreur de prédiction, une seule trace doit être créée
+    test_client, service = client
+    service_fail = FakeService()
+    service_fail.load = lambda force=False: (FakeModelQuiEchoue(), FakeVersion())
+    monkeypatch.setattr(api_main, "get_model_service", lambda: service_fail)
+
+    avant = test_client.get("/stats").json()["total_predictions"]
+    response = test_client.post("/predict", json=VALID_STUDENT)
+    assert response.status_code == 500
+    apres = test_client.get("/stats").json()["total_predictions"]
+    assert apres - avant == 1
+
+
+def test_readiness_ok(client):
+    test_client, _ = client
+    response = test_client.get("/ready")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "pret"
+    assert body["model_version"] == "42"
+
+
+def test_readiness_en_panne(client, monkeypatch):
+    test_client, _ = client
+    service_fail = FakeService()
+    service_fail.fail_load = True
+    monkeypatch.setattr(api_main, "get_model_service", lambda: service_fail)
+    response = test_client.get("/ready")
+    assert response.status_code == 503
+
+
+def test_binaire_hors_domaine_rejete(client):
+    # Gender doit être 0 ou 1
+    test_client, _ = client
+    payload = dict(VALID_STUDENT, **{"Gender": 9})
+    response = test_client.post("/predict", json=payload)
+    assert response.status_code == 422
+
+
+def test_etat_pipeline_expose(client):
+    test_client, _ = client
+    body = test_client.get("/pipeline/status").json()
+    assert "status" in body
+    metrics = test_client.get("/pipeline/metrics").text
+    assert "dropout_pipeline_last_run_success" in metrics

@@ -1,9 +1,3 @@
-"""Tests du registre MLflow : tags de cycle de vie, promotion, retour arrière.
-
-Ces tests utilisent un backend MLflow local (fichier temporaire), sans serveur :
-le mécanisme du registre est exercé réellement.
-"""
-
 import mlflow
 import pytest
 
@@ -24,7 +18,7 @@ from dropout_pred.training.train import build_model
 
 @pytest.fixture
 def registered_model(isolated_settings):
-    """Enregistre deux versions du modèle dans un registre local."""
+    # Enregistre deux versions du modèle dans un registre local
     settings = get_settings()
     mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
     mlflow.set_experiment("test_registre")
@@ -84,3 +78,56 @@ def test_chargement_du_modele_de_production(registered_model):
 def test_chargement_sans_modele_en_production(registered_model):
     with pytest.raises(RuntimeError, match="Aucune version taggée"):
         load_production_model()
+
+
+def test_promotion_sans_fenetre_sans_production(registered_model):
+    # On tag la nouvelle version production avant d'archiver l'ancienne
+    # pour éviter d'avoir un registre sans version de production
+    promote_to_production("1")
+    promote_to_production("2")
+    production = get_production_version()
+    assert str(production.version) == "2"
+    versions = {str(version.version): version for version in get_versions()}
+    assert versions["1"].tags["stage"] == STAGE_ARCHIVED
+
+
+def test_promotion_idempotente(registered_model):
+    from dropout_pred.config import get_settings
+
+    # Promouvoir la même version deux fois ne doit créer qu'une seule entrée
+    promote_to_production("1")
+    promote_to_production("1")
+    history_path = get_settings().artifacts_dir / "registry" / "deployments.json"
+    import json
+
+    history = json.loads(history_path.read_text(encoding="utf-8"))
+    promotions = [entry for entry in history if entry["action"] == "promotion"]
+    assert len(promotions) == 1
+
+
+def test_retour_arriere_via_historique_explicite(registered_model):
+    # Le rollback utilise l'historique des déploiements, pas juste le numéro de version
+    promote_to_production("1")
+    promote_to_production("2")
+
+    premier = rollback()
+    assert str(premier["nouvelle_production"]) == "1"
+    assert str(get_production_version().version) == "1"
+
+    # Un second rollback restaurera v2, pas une version au hasard
+    second = rollback()
+    assert str(second["nouvelle_production"]) == "2"
+    assert str(get_production_version().version) == "2"
+
+
+def test_retour_arriere_sans_historique_retombe_sur_l_archive(registered_model):
+    # Sans fichier d'historique, on utilise l'archivée la plus récente
+    from dropout_pred.config import get_settings
+
+    get_settings().artifacts_dir.mkdir(parents=True, exist_ok=True)
+    promote_to_production("1")
+    promote_to_production("2")
+    history_path = get_settings().artifacts_dir / "registry" / "deployments.json"
+    history_path.unlink()
+    result = rollback()
+    assert str(result["nouvelle_production"]) == "1"
