@@ -1,17 +1,22 @@
-"""Test de charge Locust : prédictions en ligne et en lot sur l'API.
+"""Test de charge Locust: prédictions en ligne et en lot sur l'API.
 
-Scénarios :
-- PredictionEnLigne : un étudiant par requête (usage interactif) ;
-- PredictionEnLot : 20 étudiants par requête (usage par lots).
+Protocole de dimensionnement: 90% de prédictions unitaires et 10% de prédictions
+par lots de 20 étudiants. La répartition est tirée à chaque requête. Elle est donc
+garantie en proportion de requêtes, indépendamment des temps d'attente et du nombre
+d'utilisateurs simulés (un simple poids entre classes Locust ne garantirait que la
+répartition des utilisateurs, pas celle des requêtes).
 
-Lancement : make loadtest (interface web) ou make loadtest-headless (protocole chiffré).
+Lancement: make loadtest (interface web) ou make loadtest-headless (protocole chiffré).
+Les CSV de résultats sont conservés dans load_tests/results/ comme preuves.
 """
 
 import random
 
 from locust import HttpUser, between, task
 
-# Un étudiant type, tiré du dataset UCI (valeurs réalistes)
+PROBA_UNITAIRE = 0.9
+
+# Un étudiant type, tiré du dataset UCI
 ETUDIANT = {
     "Marital status": 1,
     "Application mode": 17,
@@ -47,7 +52,6 @@ ETUDIANT = {
     "Curricular units 2nd sem (grade)": 13.2,
     "Curricular units 2nd sem (without evaluations)": 0,
     "Unemployment rate": 10.8,
-    # TODO(guillaume): arthur relis les bornes de Inflation rate avec le codebook UCI
     "Inflation rate": 1.4,
     "GDP": 1.74,
 }
@@ -63,28 +67,15 @@ def etudiant_aleatoire() -> dict:
     return etudiant
 
 
-class PredictionEnLigne(HttpUser):
-    """Scénario interactif : une prédiction par requête, avec un temps de réflexion."""
+class MixPrediction(HttpUser):
+    """Charge mixte: 90% de prédictions unitaires, 10% de lots de 20."""
 
     wait_time = between(0.1, 0.5)
 
-    @task(9)
-    def predire(self):
-        self.client.post("/predict", json=etudiant_aleatoire())
-
-    @task(1)
-    def feedback(self):
-        # Un utilisateur sur dix consulte les statistiques du service
-        self.client.get("/stats")
-
-
-class PredictionEnLot(HttpUser):
-    """Scénario par lots : 20 étudiants par requête, sans temps de réflexion."""
-
-    wait_time = between(0.0, 0.1)
-
-    # TODO(guillaume): arthur prépare la migration PostgreSQL quand SQLite sature
     @task
-    def predire_lot(self):
-        students = [etudiant_aleatoire() for _ in range(20)]
-        self.client.post("/predict/batch", json={"students": students})
+    def predire(self):
+        if random.random() < PROBA_UNITAIRE:
+            self.client.post("/predict", json=etudiant_aleatoire(), name="/predict [unitaire]")
+        else:
+            students = [etudiant_aleatoire() for _ in range(20)]
+            self.client.post("/predict/batch", json={"students": students}, name="/predict/batch [lot de 20]")

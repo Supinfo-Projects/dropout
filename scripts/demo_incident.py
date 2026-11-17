@@ -1,67 +1,110 @@
-"""Démo d'incident contrôlé : un lot de données corrompu doit bloquer l'entraînement.
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
-Scénario (cf. rapport) : un bug en amont corrompt le lot de données du jour —
-valeurs impossibles (notes > 200) et une classe surreprésentée. Les contrôles
-qualité doivent interrompre le pipeline AVANT l'entraînement et déclencher une
-alerte, sans toucher au modèle en production.
+import pandas as pd
 
-Le script restaure les données saines à la fin pour ne pas laisser le dépôt
-dans un état dégradé.
-"""
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import shutil
+from pipelines.retrain import retrain_flow
 
-from dropout_pred.alerting import send_alert
 from dropout_pred.config import get_settings
-from dropout_pred.data.batches import load_cumulative_batches
-from dropout_pred.data.validate import DataValidationError, validate_or_raise
+from dropout_pred.data.schema import FEATURE_COLUMNS, TARGET_CLASSES
+from dropout_pred.pipeline_state import read_pipeline_state
+from dropout_pred.registry import get_production_version, get_versions, load_production_model
 
-settings = get_settings()
-batches_dir = settings.data_dir / "batches"
-lot_path = batches_dir / "lot_005.csv"
-sauvegarde = batches_dir / "lot_005.csv.sauvegarde"
+ETUDIANT_PATH = Path(__file__).resolve().parents[1] / "load_tests" / "exemple_etudiant.json"
 
 
-def corrompre_le_lot() -> None:
-    """Simule un bug de collecte : notes impossibles + classe cible écrasée."""
-    import pandas as pd
-
-    frame = pd.read_csv(lot_path)
-    frame["Admission grade"] = 999.0  # hors plage : la note va de 0 à 200
-    frame["Target"] = "Graduate"  # collecte partielle : deux classes ont disparu
-    frame.to_csv(lot_path, index=False)
-    print("Lot 005 corrompu (notes impossibles + classes manquantes).")
+def _predire_production() -> dict:
+    model, version = load_production_model()
+    entree = json.loads(ETUDIANT_PATH.read_text(encoding="utf-8"))
+    frame = pd.DataFrame([entree]).reindex(columns=FEATURE_COLUMNS)
+    probabilities = model.predict_proba(frame)[0]
+    return {
+        "version": str(version.version),
+        "classe_predite": TARGET_CLASSES[int(probabilities.argmax())],
+    }
 
 
 def main() -> None:
-    if not lot_path.exists():
-        raise SystemExit(
-            "Les lots ne sont pas construits. Lancez d'abord : make retrain N=1"
-        )
+    settings = get_settings()
+    lignes: list[str] = []
 
-    shutil.copy(lot_path, sauvegarde)
-    try:
-        corrompre_le_lot()
-        frame = load_cumulative_batches(5, settings)
-        print(f"Chargement des 5 lots : {len(frame)} lignes")
-        print("Lancement des contrôles qualité...\n")
-        try:
-            validate_or_raise(frame, settings)
-            print("ERREUR DE LA DEMO : les données corrompues auraient dû être bloquées !")
-        except DataValidationError as exc:
-            print("Pipeline interrompue comme prévu :")
-            print(exc)
-            send_alert(
-                "Données non conformes : entraînement interrompu",
-                "Le lot 005 contient des valeurs hors plage et des classes manquantes. "
-                "Le modèle en production n'a pas été modifié.",
-                settings,
-            )
-            print("\nAlerte enregistrée dans artifacts/alerts/alerts.log")
-            print("Le modèle en production est intact : aucune version n'a été créée.")
-    finally:
-        shutil.move(sauvegarde, lot_path)
-        print("\nDonnées saines restaurées.")
+    def trace(message: str) -> None:
+        print(message)
+        lignes.append(message)
+
+    production_avant = get_production_version(settings)
+    if production_avant is None:
+        raise SystemExit(
+            "Aucun modèle en production. Lancez d'abord make retrain N=1"
+        )
+    versions_avant = {str(v.version) for v in get_versions(settings)}
+    prediction_avant = _predire_production()
+
+    trace("=== DOMO D'INCIDENT CONTROLE ===")
+    trace(f"Horodatage: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+    trace(f"Production avant l'incident: version {production_avant.version}")
+    trace(f"Versions enregistrées avant: {sorted(versions_avant, key=int)}")
+    trace(
+        f"Prédiction de production avant: version {prediction_avant['version']}, "
+        f"classe {prediction_avant['classe_predite']}"
+    )
+    trace("")
+    trace("Injection d'un lot corrompu et exécution de la flow Prefect...")
+    trace("")
+
+    etat = retrain_flow(n_batches=5, corrupt_data=True, return_state=True)
+    trace(f"État final de la flow Prefect: {etat.name} (échec: {etat.is_failed()})")
+
+    production_apres = get_production_version(settings)
+    versions_apres = {str(v.version) for v in get_versions(settings)}
+    prediction_apres = _predire_production()
+    etat_pipeline = read_pipeline_state() or {}
+
+    trace("")
+    trace("=== VERIFICATIONS ===")
+    trace(
+        f"1. Aucune nouvelle version créée: "
+        f"{'OK' if versions_apres == versions_avant else 'ECHEC'} "
+        f"({len(versions_apres)} versions avant et après)"
+    )
+    trace(
+        f"2. Production inchangée: "
+        f"{'OK' if str(production_apres.version) == str(production_avant.version) else 'ECHEC'} "
+        f"(version {production_apres.version})"
+    )
+    trace(
+        f"3. La production sert toujours: version {prediction_apres['version']}, "
+        f"classe {prediction_apres['classe_predite']} "
+        f"{'(identique à avant)' if prediction_apres == prediction_avant else '(DIFFERENTE DE AVANT !!!)'}"
+    )
+    trace(
+        f"4. Alerte enregistrée: "
+        f"{'OK' if (settings.artifacts_dir / 'alerts' / 'alerts.log').exists() else 'ECHEC'} "
+        f"(artifacts/alerts/alerts.log)"
+    )
+    trace(f"5. État du traitement exposé à la supervision: {etat_pipeline.get('state')}")
+
+    incident_ok = (
+        versions_apres == versions_avant
+        and str(production_apres.version) == str(production_avant.version)
+        and prediction_apres == prediction_avant
+        and etat.is_failed()
+    )
+    trace("")
+    trace(f"RÉSULTAT : {'incident maitrisé' if incident_ok else 'ECHEC DE LA DEMO'}")
+
+    preuve_dir = settings.artifacts_dir / "demo_incident"
+    preuve_dir.mkdir(parents=True, exist_ok=True)
+    preuve_path = preuve_dir / "preuve_incident.txt"
+    preuve_path.write_text("\n".join(lignes) + "\n", encoding="utf-8")
+    trace(f"Preuve sauvegardée: {preuve_path}")
+
+    if not incident_ok:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

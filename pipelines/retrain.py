@@ -1,25 +1,16 @@
-"""Pipeline de réentraînement orchestré par Prefect.
-
-Étapes : ingestion -> découpage en lots -> chargement cumulé -> contrôles qualité ->
-prétraitement -> entraînement -> évaluation -> décision de mise en service.
-
-Mécanismes opérationnels (cf. cours, chapitre 5) :
-- retries sur l'ingestion (la source UCI peut être momentanément indisponible) ;
-- contrôles qualité bloquants : une DataValidationError interrompt la pipeline ;
-- alerte systématique en cas d'échec (fichier de log + mail si SMTP configuré) ;
-- cache du prétraitement tant que les entrées n'ont pas changé ;
-- traçabilité complète dans MLflow (paramètres, données, métriques, artefacts).
-"""
+"""Pipeline de réentrainement orchestré par Prefect."""
 
 import argparse
+import time
 from datetime import timedelta
 
 from prefect import flow, get_run_logger, task
+from prefect.runtime import flow_run as prefect_flow_run
 from prefect.tasks import task_input_hash
 
 from dropout_pred.alerting import send_alert
 from dropout_pred.config import get_settings
-from dropout_pred.data.batches import build_batches, load_cumulative_batches
+from dropout_pred.data.batches import build_batches, load_cumulative_batches, load_validation_set
 from dropout_pred.data.ingest import ingest
 from dropout_pred.data.preprocess import (
     encode_target,
@@ -32,9 +23,11 @@ from dropout_pred.evaluation.evaluate import (
     meets_production_requirements,
     plot_confusion_matrix,
 )
+from dropout_pred.pipeline_state import write_pipeline_state
 from dropout_pred.registry import (
     STAGE_RELEASE_CANDIDATE,
     get_production_version,
+    load_production_model,
     promote_to_production,
     tag_version,
 )
@@ -46,7 +39,7 @@ def t_ingest() -> dict:
     return ingest()
 
 
-@task(description="Découpe le dataset historique en lots simulés")
+@task(description="Découpe le dataset historique en lots + jeu de validation commun")
 def t_build_batches() -> int:
     paths = build_batches()
     return len(paths)
@@ -57,7 +50,12 @@ def t_load_batches(n_batches: int):
     return load_cumulative_batches(n_batches)
 
 
-@task(description="Contrôles qualité bloquants avant prétraitement")
+@task(description="Charge le jeu de validation commun (exclu de tout entrainement)")
+def t_load_validation():
+    return load_validation_set()
+
+
+@task(description="Controles qualité bloquants avant prétraitement")
 def t_validate(frame) -> dict:
     report, report_path = validate_or_raise(frame)
     return {
@@ -70,7 +68,7 @@ def t_validate(frame) -> dict:
 
 
 @task(
-    description="Prétraitement : split stratifié (mis en cache tant que les entrées sont identiques)",
+    description="Prétraitement: split stratifié (mis en cache tant que les entrées sont identiques)",
     cache_key_fn=task_input_hash,
     cache_expiration=timedelta(hours=1),
 )
@@ -78,6 +76,12 @@ def t_preprocess(frame):
     features, target = split_features_target(frame)
     target_encoded = encode_target(target)
     return train_test_split_stratified(features, target_encoded)
+
+
+@task(description="Préparation du jeu de validation commun (features + cible encodée)")
+def t_preprocess_validation(validation_frame):
+    features, target = split_features_target(validation_frame)
+    return features, encode_target(target)
 
 
 @task(description="Entraînement du modèle")
@@ -90,59 +94,113 @@ def t_evaluate(model, x_test, y_test) -> dict:
     return compute_metrics(model, x_test, y_test)
 
 
-@task(description="Traçabilité MLflow : paramètres, métriques, artefacts, registre")
-def t_log_to_mlflow(model, params: dict, metrics: dict, artifacts: dict) -> str:
-    _, _, version_number = log_training_to_mlflow(
+@task(description="Traçabilité MLflow: paramètres, métriques, artefacts, registre")
+def t_log_to_mlflow(model, params: dict, metrics: dict, artifacts: dict) -> tuple[str, str]:
+    _, run_id, version_number = log_training_to_mlflow(
         model, params=params, metrics=metrics, artifacts=artifacts
     )
-    return version_number
+    return run_id, version_number
+
+
+def _corrupt_frame(frame):
+    """Simule un bug de collecte en amont: texte dans une colonne numérique,
+    valeurs hors domaine binaire et classes cibles écrasées."""
+    frame = frame.copy()
+    frame["Admission grade"] = "invalide"
+    frame["Gender"] = 9
+    frame["Target"] = "Graduate"
+    return frame
 
 
 @task(description="Décision de mise en service (promotion ou maintien en release_candidate)")
-def t_promote(metrics: dict, version_number: str) -> dict:
+def t_promote(metrics: dict, validation_metrics: dict, version_number: str, run_id: str, x_val, y_val) -> dict:
+    """Compare le candidat à la production sur le jeu de validation commun.
+
+    Les deux modèles sont évalués sur le même jeu de validation, exclu de tous
+    les entrainements. La décision, ses seuils, la version comparée et l'exécution
+    Prefect sont journalisés dans le run MLflow du candidat.
+    """
     settings = get_settings()
     logger = get_run_logger()
 
     tag_version(version_number, STAGE_RELEASE_CANDIDATE, settings)
 
     eligible, reason = meets_production_requirements(metrics, settings)
+    decision = {
+        "decision": "maintenu_release_candidate",
+        "raison": reason,
+        "seuils": {"min_f1_macro": settings.min_f1_macro, "min_recall_dropout": settings.min_recall_dropout},
+        "f1_macro_validation": validation_metrics["f1_macro"],
+        "run_prefect": prefect_flow_run.id,
+    }
     if not eligible:
-        logger.warning("Modèle non éligible à la production : %s", reason)
-        return {"decision": "maintenu_release_candidate", "raison": reason}
+        logger.warning("Modèle non éligible à la production: %s", reason)
+        _log_decision_to_mlflow(run_id, decision, settings)
+        return decision
 
     production = get_production_version(settings)
     if production is not None:
-        from mlflow import MlflowClient
-
-        client = MlflowClient(tracking_uri=settings.mlflow_tracking_uri)
-        production_metrics = client.get_run(production.run_id).data.metrics
-        current_f1 = production_metrics.get("f1_macro", 0.0)
-        if metrics["f1_macro"] < current_f1:
+        production_model, _ = load_production_model(settings)
+        production_validation_metrics = compute_metrics(production_model, x_val, y_val)
+        decision["version_comparée"] = str(production.version)
+        decision["f1_macro_validation_production"] = production_validation_metrics["f1_macro"]
+        if validation_metrics["f1_macro"] < production_validation_metrics["f1_macro"]:
             reason = (
-                f"f1_macro={metrics['f1_macro']} < f1_macro production={current_f1:.4f} "
-                f"(version {production.version})"
+                f"f1_macro validation={validation_metrics['f1_macro']} < "
+                f"f1_macro validation production={production_validation_metrics['f1_macro']} "
+                f"(version {production.version}, même jeu de validation)"
             )
-            logger.warning("Modèle moins bon que la production : %s", reason)
-            return {"decision": "maintenu_release_candidate", "raison": reason}
+            decision["raison"] = reason
+            logger.warning("Modèle moins bon que la production sur le jeu de validation: %s", reason)
+            _log_decision_to_mlflow(run_id, decision, settings)
+            return decision
 
     promote_to_production(version_number, settings)
+    decision["decision"] = "promu_production"
+    decision["version"] = version_number
     logger.info("Version %s promue en production", version_number)
-    return {"decision": "promu_production", "version": version_number, "raison": reason}
+    _log_decision_to_mlflow(run_id, decision, settings)
+    return decision
+
+
+def _log_decision_to_mlflow(run_id: str, decision: dict, settings) -> None:
+    """Journalise la décision de mise en service dans le run MLflow du candidat."""
+    from mlflow import MlflowClient
+
+    client = MlflowClient(tracking_uri=settings.mlflow_tracking_uri)
+    for key, value in decision.items():
+        if value is None:
+            continue
+        client.log_param(run_id, f"decision_{key}", str(value))
+    client.set_tag(run_id, "decision", decision["decision"])
+    client.set_tag(run_id, "run_prefect", decision.get("run_prefect", ""))
 
 
 @flow(name="reentrainement_decrochage", log_prints=True)
-def retrain_flow(n_batches: int = 1) -> dict:
-    """Pipeline complète de réentraînement sur les n premiers lots de données."""
+def retrain_flow(n_batches: int = 1, corrupt_data: bool = False) -> dict:
+    """Pipeline complète de réentrainement sur les n premiers lots de données.
+
+    corrupt_data=True simule un lot corrompu après la construction des lots (point
+    d'injection utilisé par la démo d'incident): les controles qualité doivent alors
+    interrompre la flow avant l'entrainement.
+    """
     settings = get_settings()
     logger = get_run_logger()
+    started_at = time.time()
+    write_pipeline_state("running", started_at=started_at, n_batches=n_batches)
     try:
         ingestion = t_ingest()
         t_build_batches()
         frame = t_load_batches(n_batches)
+        if corrupt_data:
+            logger.warning("Injection d'un lot corrompu (point d'entrée de la démo d'incident)")
+            frame = _corrupt_frame(frame)
         validation = t_validate(frame)
-        logger.info("Contrôles qualité :\n%s", validation["summary"])
+        logger.info("Controles qualité:\n%s", validation["summary"])
 
         x_train, x_test, y_train, y_test = t_preprocess(frame)
+        validation_frame = t_load_validation()
+        x_val, y_val = t_preprocess_validation(validation_frame)
 
         params = {
             "n_batches": n_batches,
@@ -153,9 +211,11 @@ def retrain_flow(n_batches: int = 1) -> dict:
         }
         model = t_train(x_train, y_train)
         metrics = t_evaluate(model, x_test, y_test)
+        validation_metrics = t_evaluate(model, x_val, y_val)
+        metrics["f1_macro_validation"] = validation_metrics["f1_macro"]
 
         figure_path = plot_confusion_matrix(metrics["confusion_matrix"], settings)
-        version_number = t_log_to_mlflow(
+        run_id, version_number = t_log_to_mlflow(
             model,
             params,
             metrics,
@@ -165,21 +225,40 @@ def retrain_flow(n_batches: int = 1) -> dict:
             },
         )
 
-        decision = t_promote(metrics, version_number)
-        logger.info("Décision de mise en service : %s", decision)
+        decision = t_promote(metrics, validation_metrics, version_number, run_id, x_val, y_val)
+        logger.info("Décision de mise en service: %s", decision)
+        write_pipeline_state(
+            "succes",
+            started_at=started_at,
+            duration_s=round(time.time() - started_at, 1),
+            version=version_number,
+            n_batches=n_batches,
+        )
         return {"metrics": metrics, "decision": decision}
     except Exception as exc:  # noqa: BLE001
         send_alert(
-            "Échec du pipeline de réentraînement",
-            f"Erreur : {type(exc).__name__}: {exc}",
+            "Echec du pipeline de réentrainement",
+            f"Erreur: {type(exc).__name__}: {exc}",
             settings,
+        )
+        write_pipeline_state(
+            "echec",
+            started_at=started_at,
+            duration_s=round(time.time() - started_at, 1),
+            n_batches=n_batches,
+            error=f"{type(exc).__name__}: {exc}",
         )
         raise
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Pipeline de réentraînement (Prefect)")
+    parser = argparse.ArgumentParser(description="Pipeline de réentrainement (Prefect)")
     parser.add_argument("--batches", type=int, default=1, help="Nombre de lots cumulés à consommer")
+    parser.add_argument(
+        "--corrupt-data",
+        action="store_true",
+        help="Injecte un lot corrompu après la construction des lots (démo d'incident)",
+    )
     parser.add_argument(
         "--serve",
         action="store_true",
@@ -194,9 +273,9 @@ def main() -> None:
             parameters={"n_batches": 5},
         )
     else:
-        result = retrain_flow(n_batches=args.batches)
-        print(f"\nRésultat : {result['decision']}")
-        print(f"Métriques : {result['metrics']}")
+        result = retrain_flow(n_batches=args.batches, corrupt_data=args.corrupt_data)
+        print(f"\nRésultat: {result['decision']}")
+        print(f"Métriques: {result['metrics']}")
 
 
 if __name__ == "__main__":

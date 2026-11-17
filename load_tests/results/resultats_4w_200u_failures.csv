@@ -1,0 +1,3 @@
+Method,Name,Error,Occurrences,First Seen,Last Seen
+POST,/predict/batch [lot de 20],HTTPError('500 Server Error: Internal Server Error for url: /predict/batch [lot de 20]'),10,2026-11-17T15:57:08Z,2026-11-17T15:57:42Z
+POST,/predict [unitaire],HTTPError('500 Server Error: Internal Server Error for url: /predict [unitaire]'),7,2026-11-17T15:57:07Z,2026-11-17T15:57:40Z
